@@ -22,8 +22,7 @@ import zio.stacktracer.TracingImplicits.disableAutoTrace
 import java.util.concurrent.atomic.{AtomicInteger, AtomicLong}
 import java.util.concurrent.locks.LockSupport
 import java.util.concurrent.{ConcurrentLinkedQueue, ThreadLocalRandom}
-import java.nio.channels.{Selector => NioSelector, SelectionKey, SelectionKey => NioSelectionKey}
-import java.nio.channels.spi.AbstractSelector
+import java.nio.channels.{SelectionKey => NioSelectionKey, Selector => NioSelector}
 import scala.collection.mutable
 import scala.concurrent.{BlockContext, CanAwait}
 
@@ -32,7 +31,7 @@ private final class ZIOScheduler(autoBlocking: Boolean) extends Executor { paren
   import Trace.{empty => emptyTrace}
   import ZIOScheduler.{poolSize, workerOrNull}
 
-  private[this] val globalQueue      = new PartitionedLinkedQueue[Runnable](poolSize * 4)
+  private[this] val globalQueue     = new PartitionedLinkedQueue[Runnable](poolSize * 4)
   private[this] val cache           = new ConcurrentLinkedQueue[ZIOScheduler.Worker]()
   private[this] val idle            = new ConcurrentLinkedQueue[ZIOScheduler.Worker]()
   private[this] val globalLocations = makeLocations()
@@ -271,7 +270,7 @@ private final class ZIOScheduler(autoBlocking: Boolean) extends Executor { paren
     new ZIOScheduler.Worker {
       self =>
       override val submittedLocations: ZIOScheduler.Locations = makeLocations()
-      private[ZIOScheduler] val selector: NioSelector = NioSelector.open()
+      private[ZIOScheduler] val selector: NioSelector         = NioSelector.open()
 
       final override def run(): Unit = {
         val globalQueue = parent.globalQueue
@@ -380,9 +379,7 @@ private final class ZIOScheduler(autoBlocking: Boolean) extends Executor { paren
               }
             }
             if (!active && !isInterrupted) {
-              if (!selector.isSupported) {
-                LockSupport.park()
-              } else {
+              if (selector.isOpen) {
                 val polled = selector.select(100)
                 if (polled == 0) {
                   val hasWork = !localQueue.isEmpty() || !globalQueue.isEmpty()
@@ -390,6 +387,8 @@ private final class ZIOScheduler(autoBlocking: Boolean) extends Executor { paren
                     LockSupport.park()
                   }
                 }
+              } else {
+                LockSupport.park()
               }
             }
             searching = true
@@ -451,15 +450,14 @@ private final class ZIOScheduler(autoBlocking: Boolean) extends Executor { paren
         ops: Int,
         attachment: AnyRef
       ): NioSelectionKey = {
-        val key = channel.register(selector, ops, attachment)
+        val key          = channel.register(selector, ops, attachment)
         val currentState = state.get
         maybeUnparkWorker(currentState)
         key
       }
 
-      def wakeup(): Unit = {
+      def wakeup(): Unit =
         selector.wakeup()
-      }
     }
 
   private def maybeUnparkWorker(currentState: Int): Unit = {
@@ -519,7 +517,7 @@ private object ZIOScheduler {
     }
 
     object Disabled extends Locations {
-      def get(trace: Trace): Long  = 0L
+      def get(trace: Trace): Long = 0L
       def put(trace: Trace): Long = 0L
     }
   }
