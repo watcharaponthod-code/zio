@@ -320,9 +320,9 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
    * '''NOTE''': This method must be invoked by the fiber itself.
    */
   private def drainQueueWhileRunning(cur0: ZIO.Erased): ZIO.Erased = {
-    var cur     = cur0
+    var cur      = cur0
     val messages = inbox.drainBatch()
-    var i = 0
+    var i        = 0
     while (i < messages.length) {
       val message = messages(i)
       message match {
@@ -357,7 +357,7 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
     var resumption: ZIO.Erased = null
 
     val messages = inbox.drainBatch()
-    var i = 0
+    var i        = 0
     while (i < messages.length) {
       val message = messages(i)
       message match {
