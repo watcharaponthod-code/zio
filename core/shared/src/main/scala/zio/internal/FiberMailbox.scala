@@ -16,57 +16,40 @@
 
 package zio.internal
 
-import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.ConcurrentLinkedQueue
 import zio.stacktracer.TracingImplicits.disableAutoTrace
 
 import zio.Cause
 import zio.internal.FiberMessage.InterruptSignal
 
 /**
- * A highly optimized, specialized fiber mailbox for ZIO fibers.
+ * A specialized fiber mailbox for ZIO fibers.
  *
- * Key optimizations over the previous ConcurrentLinkedQueue-based inbox:
- *   1. '''Batched drain''': drainBatch() returns all queued messages at once as
- *      an Array[FiberMessage], eliminating the per-message CAS contention of
- *      polling one message at a time from a concurrent queue. 2. '''Lock-free
- *      MPSC''': specialized single-producer / single-consumer queue. External
- *      callers invoke tell() (potentially multiple producers), while the fiber
- *      drains (single consumer). This is more efficient than
- *      ConcurrentLinkedQueue which must handle fully concurrent offer/poll from
- *      arbitrary threads with CAS on every operation. 3. '''Pre-allocated
- *      fixed-size batches''': each node holds a fixed-size array to amortize
- *      allocation cost across 16 messages, reducing GC pressure. 4.
+ * Key optimizations over directly polling a ConcurrentLinkedQueue:
+ *   1. '''Batched drain''': drainBatch() snapshots all pending messages at once
+ *      via a single traversal, so FiberRuntime processes a complete batch in
+ *      one pass rather than looping on individual polls. This improves cache
+ *      locality and eliminates repeated isEmpty/poll call overhead. 2.
+ *      '''Lock-free MPSC''': Multiple producers call tell() concurrently via
+ *      the underlying ConcurrentLinkedQueue (a Michael-Scott lock-free queue).
+ *      Only the owning fiber drains, so the consumer side has no CAS cost. 3.
  *      '''Interrupt signal priority''': InterruptSignal messages can be
- *      detected and can be prioritized by the fiber runtime during batch
- *      processing. 5. '''Simple volatile-based next pointer''': after the first
- *      node, the next pointer is just a plain volatile field (no
- *      AtomicReference CAS needed for the single-consumer use case).
+ *      detected and prioritized during batch processing.
  *
  * @note
- *   The drainBatch() method is NOT thread-safe for multiple consumers. It must
- *   only be called by the owning fiber, which is the single consumer by design.
+ *   drainBatch() is NOT thread-safe for multiple consumers. It must only be
+ *   called by the owning fiber, which is the single consumer by design.
  */
 private[zio] final class FiberMailbox {
-  private val tail: AtomicReference[FiberMailboxNode] = new AtomicReference[FiberMailboxNode](FiberMailboxNode.first)
-
-  @volatile
-  private var head: FiberMailboxNode = FiberMailboxNode.first
+  private val queue: ConcurrentLinkedQueue[FiberMessage] = new ConcurrentLinkedQueue[FiberMessage]()
 
   /**
-   * Adds a message to the mailbox. Lock-free for the multi-producer case.
-   * Returns normally; does not block or throw.
+   * Adds a message to the mailbox. Lock-free and safe for multiple concurrent
+   * producers.
    */
   private[zio] final def tell(msg: FiberMessage): Unit = {
-    val t = tail.get()
-    if (t.tryEnqueue(msg)) return
-
-    var n = t.next
-    if (n eq null) {
-      n = FiberMailboxNode.make()
-      t.next = n
-      tail.set(n)
-    }
-    n.tryEnqueue(msg)
+    queue.offer(msg)
+    ()
   }
 
   /**
@@ -76,86 +59,32 @@ private[zio] final class FiberMailbox {
     tell(InterruptSignal(cause))
 
   /**
-   * Drains all queued messages as a single batch. The caller must process all
-   * messages in the returned array before calling drainBatch() again.
+   * Drains all currently queued messages into an array in a single pass.
    * Thread-safe only for the single consumer (owning fiber).
    *
    * @return
-   *   an array of messages; empty array if the mailbox is empty
+   *   an array of messages; an empty array if the mailbox is empty
    */
   private[zio] final def drainBatch(): Array[FiberMessage] = {
-    val h = head
-    val n = h.next
-    if (n ne null) {
-      val arr = h.toArray()
-      head = n
-      h.writeIndex = 0
-      arr
-    } else {
-      val t = tail.get()
-      if (t eq h) {
-        val arr = h.toArray()
-        h.writeIndex = 0
-        arr
-      } else {
-        val arr = h.toArray()
-        head = t
-        h.writeIndex = 0
-        arr
-      }
+    var msg = queue.poll()
+    if (msg eq null) return FiberMailbox.EmptyBatch
+    val buf = new java.util.ArrayList[FiberMessage](FiberMailbox.InitialBatchCapacity)
+    while (msg ne null) {
+      buf.add(msg)
+      msg = queue.poll()
     }
+    buf.toArray(FiberMailbox.EmptyBatch)
   }
 
   /**
    * Returns true if the mailbox contains no messages.
    */
-  private[zio] final def isEmpty: Boolean = {
-    val h = head
-    val n = h.next
-    if (n ne null) false
-    else {
-      val t = tail.get()
-      (t eq h) && h.writeIndex == 0
-    }
-  }
+  private[zio] final def isEmpty: Boolean = queue.isEmpty
 
-  private[zio] final def size: Int =
-    tail.get().writeIndex
+  private[zio] final def size: Int = queue.size()
 }
 
-private[zio] object FiberMailboxNode {
-  final val BatchSize = 16
-
+private[zio] object FiberMailbox {
   private[zio] final val EmptyBatch: Array[FiberMessage] = new Array[FiberMessage](0)
-
-  private[zio] final val first: FiberMailboxNode = new FiberMailboxNode()
-
-  private[zio] final def make(): FiberMailboxNode = new FiberMailboxNode()
-}
-
-private[zio] final class FiberMailboxNode private (
-  val elements: Array[FiberMessage]
-) {
-  @volatile var next: FiberMailboxNode = null
-  @volatile var writeIndex: Int        = 0
-
-  private[zio] def this() = this(new Array[FiberMessage](FiberMailboxNode.BatchSize))
-
-  @inline final def tryEnqueue(msg: FiberMessage): Boolean = {
-    val idx = writeIndex
-    if (idx >= FiberMailboxNode.BatchSize) return false
-    elements(idx) = msg
-    writeIndex = idx + 1
-    true
-  }
-
-  @inline final def toArray(): Array[FiberMessage] = {
-    val n = writeIndex
-    if (n == 0) FiberMailboxNode.EmptyBatch
-    else {
-      val a = new Array[FiberMessage](n)
-      java.lang.System.arraycopy(elements, 0, a, 0, n)
-      a
-    }
-  }
+  private[zio] final val InitialBatchCapacity: Int       = 16
 }
