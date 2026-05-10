@@ -54,10 +54,11 @@ private[zio] object FiberSet {
       map.remove(ref)
     }
 
-    def fibers: Iterable[Fiber.Runtime[_, _]] =
+    def fibers: Iterable[Fiber.Runtime[_, _]] = {
+      val underlying = map
       new Iterable[Fiber.Runtime[_, _]] {
         def iterator: Iterator[Fiber.Runtime[_, _]] = {
-          val mapIterator = map.iterator()
+          val mapIterator = underlying.iterator()
           new Iterator[Fiber.Runtime[_, _]] {
             private var _next: Fiber.Runtime[_, _] = prefetchOrNull()
 
@@ -92,6 +93,7 @@ private[zio] object FiberSet {
           }
         }
       }
+    }
   }
 
   type JSet[A] = java.util.Set[A]
